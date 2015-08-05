@@ -902,7 +902,9 @@ ngx_http_req_status_show_json_handler(ngx_http_request_t *r)
                 item->pdata->requests,
                 item->node->active,
                 item->pdata->bandwidth * 8);
-        b->last = ngx_sprintf(b->last, NGX_HTTP_REQ_STATUS_JSON_FMT_NEXT);
+        if(i+1 != items.nelts) {
+            b->last = ngx_sprintf(b->last, NGX_HTTP_REQ_STATUS_JSON_FMT_NEXT);
+        }
     }
 
     b->last = ngx_sprintf(b->last, NGX_HTTP_REQ_STATUS_JSON_FMT_ZONE_LIST_E);
