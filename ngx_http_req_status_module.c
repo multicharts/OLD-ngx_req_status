@@ -6,31 +6,27 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
-static ngx_int_t ngx_http_req_status_init_zone(ngx_shm_zone_t *shm_zone,
-        void *data);
+static ngx_int_t ngx_http_req_status_init_zone(ngx_shm_zone_t *shm_zone, void *data);
 static void ngx_http_req_status_rbtree_insert_value(ngx_rbtree_node_t *temp,
         ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
 static ngx_int_t ngx_http_req_status_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_req_status_handler(ngx_http_request_t *r);
-static void *ngx_http_req_status_lookup(void *conf, ngx_uint_t hash,
-        ngx_str_t *key);
+static void *ngx_http_req_status_lookup(void *conf, ngx_uint_t hash, ngx_str_t *key);
 static void ngx_http_req_status_expire(void *conf);
 
 static void *ngx_http_req_status_create_main_conf(ngx_conf_t *cf);
 static char *ngx_http_req_status_init_main_conf(ngx_conf_t *cf, void *conf);
 static void *ngx_http_req_status_create_loc_conf(ngx_conf_t *cf);
-static char *ngx_http_req_status_merge_loc_conf(ngx_conf_t *cf, void *parent,
-        void *child);
+static char *ngx_http_req_status_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
 
-static char *ngx_http_req_status_zone(ngx_conf_t *cf, ngx_command_t *cmd,
-        void *conf);
+static char *ngx_http_req_status_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_req_status(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static char *ngx_http_req_status_show(ngx_conf_t *cf, ngx_command_t *cmd,
-        void *conf);
+static char *ngx_http_req_status_show_plain(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_req_status_show_json(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
-static ngx_int_t ngx_http_req_status_show_handler(ngx_http_request_t *r);
-static ngx_int_t ngx_http_req_status_write_filter(ngx_http_request_t *r,
-        off_t bsent);
+static ngx_int_t ngx_http_req_status_show_plain_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_req_status_show_json_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_req_status_write_filter(ngx_http_request_t *r, off_t bsent);
 
 typedef struct ngx_http_req_status_loc_conf_s ngx_http_req_status_loc_conf_t;
 
@@ -152,7 +148,23 @@ static ngx_command_t ngx_http_req_status_commands[] = {
 
     { ngx_string("req_status_show"),
       NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
-      ngx_http_req_status_show,
+      ngx_http_req_status_show_plain,
+      0,
+      0,
+      NULL
+    },
+
+    { ngx_string("req_status_show_plain"),
+      NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_http_req_status_show_plain,
+      0,
+      0,
+      NULL
+    },
+
+    { ngx_string("req_status_show_json"),
+      NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_http_req_status_show_json,
       0,
       0,
       NULL
@@ -550,7 +562,7 @@ ngx_http_req_status_cmp_items(const void *one, const void *two)
 }
 
 static ngx_int_t
-ngx_http_req_status_show_handler(ngx_http_request_t *r)
+ngx_http_req_status_show_plain_handler(ngx_http_request_t *r)
 {
     size_t                              size, item_size;
     u_char                              long_num, full_info, clear_status;
@@ -745,6 +757,178 @@ ngx_http_req_status_show_handler(ngx_http_request_t *r)
 
     return ngx_http_output_filter(r, &out);
 }
+
+static ngx_int_t
+ngx_http_req_status_show_json_handler(ngx_http_request_t *r)
+{
+    size_t                              item_size;
+    ngx_int_t                           rc;
+    ngx_buf_t                          *b;
+    ngx_uint_t                          i;
+    ngx_array_t                         items;
+    ngx_queue_t                        *q;
+    ngx_chain_t                         out;
+    ngx_http_req_status_zone_t        **pzone;
+    ngx_http_req_status_node_t         *rsn;
+    ngx_http_req_status_main_conf_t    *rmcf;
+    ngx_http_req_status_print_item_t   *item;
+
+
+#define NGX_HTTP_REQ_STATUS_JSON_BUFFER_SIZE (int) 262144
+
+#define NGX_HTTP_REQ_STATUS_JSON_FMT_S "{"
+#define NGX_HTTP_REQ_STATUS_JSON_FMT_E "}"
+#define NGX_HTTP_REQ_STATUS_JSON_FMT_NEXT ","
+
+#define NGX_HTTP_REQ_STATUS_JSON_FMT_ZONE_LIST_S "\"zone_list\":["
+#define NGX_HTTP_REQ_STATUS_JSON_FMT_ZONE_LIST_E "]"
+
+#define NGX_HTTP_REQ_STATUS_JSON_FMT_STAT_ITEM \
+"{" \
+    "\"zone_name\":\"%s\"," \
+    "\"key\":\"%s\"," \
+    "\"max_active\":%ui," \
+    "\"max_bw\":%ui," \
+    "\"traffic\":%ui," \
+    "\"requests\":%ui," \
+    "\"active\":%ui," \
+    "\"bandwith\":%ui" \
+"}"
+
+    if (r->method != NGX_HTTP_GET && r->method != NGX_HTTP_HEAD) {
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    rc = ngx_http_discard_request_body(r);
+
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    ngx_str_set(&r->headers_out.content_type, "application/json");
+
+    if (r->method == NGX_HTTP_HEAD) {
+        r->headers_out.status = NGX_HTTP_OK;
+
+        rc = ngx_http_send_header(r);
+
+        if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+            return rc;
+        }
+    }
+
+
+    item_size = sizeof(ngx_http_req_status_print_item_t);
+
+    if (ngx_array_init(&items, r->pool, 40, item_size) != NGX_OK){
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    rmcf = ngx_http_get_module_main_conf(r, ngx_http_req_status_module);
+
+    pzone = rmcf->zones.elts;
+
+    for (i = 0; i < rmcf->zones.nelts; i++){
+        ngx_shmtx_lock(&pzone[i]->shpool->mutex);
+
+        for (q = ngx_queue_last(&pzone[i]->sh->queue);
+                q != ngx_queue_sentinel(&pzone[i]->sh->queue);
+                q = ngx_queue_prev(q))
+        {
+            rsn = ngx_queue_data(q, ngx_http_req_status_node_t, queue);
+            if (!rsn->data.requests){
+                continue;
+            }
+
+            if (rsn->last_traffic){
+                if (ngx_current_msec > rsn->last_traffic_update &&
+                        ngx_current_msec - rsn->last_traffic_update >=
+                        rmcf->interval){
+                    rsn->last_traffic_start = 0;
+                    rsn->last_traffic = 0;
+                    rsn->data.bandwidth = 0;
+                    rsn->last_traffic_update = ngx_current_msec;
+                }
+            }
+
+            item = ngx_array_push(&items);
+            if (item == NULL){
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            item->zone_name = &pzone[i]->shm_zone->shm.name;
+            item->node = rsn;
+
+            item->pdata = &rsn->data;
+        }
+
+        pzone[i]->sh->expire_lock = ngx_time() + rmcf->lock_time;
+
+        ngx_shmtx_unlock(&pzone[i]->shpool->mutex);
+    }
+
+    if (items.nelts > 1) {
+        ngx_qsort(items.elts, (size_t) items.nelts, item_size,
+                ngx_http_req_status_cmp_items);
+    }
+
+    b = ngx_create_temp_buf(r->pool, NGX_HTTP_REQ_STATUS_JSON_BUFFER_SIZE);
+    if (b == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    b->last = ngx_sprintf(b->last, NGX_HTTP_REQ_STATUS_JSON_FMT_S);
+    b->last = ngx_sprintf(b->last, NGX_HTTP_REQ_STATUS_JSON_FMT_ZONE_LIST_S);
+
+    item = items.elts;
+
+    for (i = 0; i < items.nelts; i++){
+        if (i) {
+            item = (ngx_http_req_status_print_item_t *)
+                ((u_char *)item + item_size);
+        }
+
+        /* set pdata here because of qsort above */
+        if (item->pdata == NULL){
+            item->pdata = &item->data[0];
+        }
+
+        b->last = ngx_sprintf(b->last, NGX_HTTP_REQ_STATUS_JSON_FMT_STAT_ITEM,
+                item->zone_name->data,
+                item->node->key,
+                item->pdata->max_active,
+                item->pdata->max_bandwidth * 8,
+                item->pdata->traffic * 8,
+                item->pdata->requests,
+                item->node->active,
+                item->pdata->bandwidth * 8);
+        if(i+1 != items.nelts) {
+            b->last = ngx_sprintf(b->last, NGX_HTTP_REQ_STATUS_JSON_FMT_NEXT);
+        }
+    }
+
+    b->last = ngx_sprintf(b->last, NGX_HTTP_REQ_STATUS_JSON_FMT_ZONE_LIST_E);
+    b->last = ngx_sprintf(b->last, NGX_HTTP_REQ_STATUS_JSON_FMT_E);
+
+
+    out.buf = b;
+    out.next = NULL;
+
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_length_n = b->last - b->pos;
+
+    b->last_buf = 1;
+
+    rc = ngx_http_send_header(r);
+
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    return ngx_http_output_filter(r, &out);
+}
+
+
 
 static void *
 ngx_http_req_status_create_main_conf(ngx_conf_t *cf)
@@ -1003,12 +1187,23 @@ ngx_http_req_status(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 static char *
-ngx_http_req_status_show(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+ngx_http_req_status_show_plain(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_core_loc_conf_t  *clcf;
 
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-    clcf->handler = ngx_http_req_status_show_handler;
+    clcf->handler = ngx_http_req_status_show_plain_handler;
+
+    return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_req_status_show_json(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_core_loc_conf_t  *clcf;
+
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = ngx_http_req_status_show_json_handler;
 
     return NGX_CONF_OK;
 }

@@ -58,7 +58,7 @@ req_status_show
 
 **context:** *location*
 
-Enables the request status handler in this location.
+Enables the request status handler in this location. Same as *req_status_show_plain*.
 For example:
 
     location /req-status {
@@ -87,6 +87,23 @@ It is plain text information like:
     server_name     dl.pinyin.sogou.com     913     312M    8930G   35345453        225     97M
     server_name     download.ie.sogou.com   964     275M    7462G   7979817 297     135M
 
+req_status_show_json
+---------------
+**syntax:** *req_status_show_json on*
+
+**default:** *None*
+
+**context:** *location*
+
+Enables the request status handler returning JSON in this location. 
+It returns JSON formatted information like:
+
+    {"zone_list":[
+        {"zone_name":"imgstore_appid","key":"43","max_active":27,"max_bw":6291456,"traffic":67645734912,"requests":374063,"active":0,"bandwith":0},
+        {"zone_name":"server_addr","key":"10.128.1.17","max_active":2,"max_bw":8968,"traffic":25165824,"requests":1849,"active":0,"bandwith":0},
+        {"zone_name":"server_name","key":"d.123.sogou.com","max_active":478,"max_bw":120586240,"traffic":3060164198400,"requests":30218726,"active":115,"bandwith":40894464}
+    ]}
+    
 Installation
 ============
 
